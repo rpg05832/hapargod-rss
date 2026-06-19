@@ -1,0 +1,51 @@
+name: Build Hapargod feed
+
+# מתי הסקריפט ירוץ:
+on:
+  schedule:
+    - cron: "*/20 * * * *"   # כל ~20 דקות (GitHub עלול לעכב מעט)
+  workflow_dispatch: {}        # כפתור "Run workflow" להפעלה ידנית
+  push:
+    branches: [ main ]         # גם בכל עדכון של הקבצים
+
+# הרשאה לכתוב חזרה את הקבצים המעודכנים אל ה-repo
+permissions:
+  contents: write
+
+# שלא ירוצו שתי בניות במקביל
+concurrency:
+  group: build-feed
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Build feed + page
+        run: python build_feed.py
+
+      - name: Disable Jekyll (for GitHub Pages)
+        run: touch .nojekyll
+
+      - name: Commit & push if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "אין שינויים — לא בוצע commit"
+          else
+            git commit -m "Update feed ($(date -u +%FT%TZ))"
+            git push
+          fi
