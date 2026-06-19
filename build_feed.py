@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-בונה פיד RSS ודף אינטרנט (HTML) מערוץ הטלגרם הציבורי של "הפרגוד".
-מקור: https://t.me/s/Moshepargod  (עמוד התצוגה הציבורי של הערוץ)
+בונה פיד RSS + דף אינטרנט (HTML) מערוץ הטלגרם הציבורי של "הפרגוד".
 
-הסקריפט מייצר שני קבצים:
-  - feed.xml     : פיד RSS תקני (לחיבור לקוראי RSS)
-  - index.html   : דף אינטרנט נקי בעברית (RTL) שמציג את העדכונים האחרונים
+תכונות:
+  - ארכיון מצטבר (data.json) -> אפשר לגלול להיסטוריה ארוכה (לא רק 20 האחרונים)
+  - סרטונים קצרים שטלגרם חושפת מתנגנים ישירות בתוך הדף (בפוסטים האחרונים)
+  - תמונות נטענות "בעצלתיים" (lazy) לגלילה חלקה
+  - מייצר feed.xml (RSS) + index.html
 
-אין צורך בשום מפתח/הרשמה. הכול מבוסס על העמוד הציבורי של הערוץ.
+מקור: https://t.me/s/Moshepargod
 """
 
+import os
 import re
+import json
+import time
 import html
 import datetime
 import email.utils
@@ -20,105 +24,149 @@ import requests
 from bs4 import BeautifulSoup
 
 # ----------------------------- הגדרות -----------------------------
-CHANNEL = "Moshepargod"                       # שם המשתמש של הערוץ בטלגרם
+CHANNEL = "Moshepargod"
 CHANNEL_TITLE = "חדשות הפרגוד"
-SOURCE_URL = f"https://t.me/s/{CHANNEL}"
+BASE = f"https://t.me/s/{CHANNEL}"
 SITE_TITLE = "הפרגוד — עדכונים (לא רשמי)"
-SITE_DESC = "עדכונים אחרונים מערוץ הטלגרם הציבורי של הפרגוד. דף לא רשמי, נבנה אוטומטית."
-MAX_ITEMS = 40                                # כמה פריטים מקסימום להציג
+SITE_DESC = "עדכונים מערוץ הטלגרם הציבורי של הפרגוד. דף לא רשמי, נבנה אוטומטית."
 
-# אזור זמן ישראל לתצוגת התאריכים
+DATA_FILE = "data.json"
+MAX_ARCHIVE = 1000            # כמה פריטים לשמור ולהציג בדף. ערך גבוה = יותר היסטוריה אבל דף כבד יותר.
+MAX_FEED_ITEMS = 80           # כמה פריטים לכלול בקובץ ה-RSS.
+BACKFILL_PAGES_PER_RUN = 12   # כמה עמודי היסטוריה ישנים למשוך בכל ריצה (עד שהארכיון מתמלא).
+
 try:
     from zoneinfo import ZoneInfo
     IL_TZ = ZoneInfo("Asia/Jerusalem")
-except Exception:  # גיבוי אם אין tzdata
+except Exception:
     IL_TZ = datetime.timezone(datetime.timedelta(hours=3))
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
 
-# ----------------------------- שליפה -----------------------------
-def fetch_page() -> str:
-    resp = requests.get(SOURCE_URL, headers={"User-Agent": UA}, timeout=30)
-    resp.raise_for_status()
-    return resp.text
+# ----------------------------- שליפה + פענוח -----------------------------
+def fetch(url: str) -> str:
+    r = requests.get(url, headers={"User-Agent": UA}, timeout=30)
+    r.raise_for_status()
+    return r.text
 
 
-# ----------------------------- פענוח -----------------------------
-def parse_messages(page_html: str):
+def _bg_url(style: str):
+    m = re.search(r"url\(['\"]?([^'\")]+)['\"]?\)", style or "")
+    return m.group(1) if m else None
+
+
+def parse_page(page_html: str):
     soup = BeautifulSoup(page_html, "html.parser")
-    items = []
+    out = []
     for msg in soup.select(".tgme_widget_message"):
         try:
-            post = msg.get("data-post")            # לדוגמה: "Moshepargod/53435"
-            if not post:
+            post = msg.get("data-post")           # "Moshepargod/58660"
+            if not post or "/" not in post:
+                continue
+            try:
+                mid = int(post.split("/")[-1])
+            except ValueError:
                 continue
             link = "https://t.me/" + post
 
-            # טקסט ההודעה (כולל שבירות שורה)
+            # טקסט
             text = ""
-            text_el = msg.select_one(".tgme_widget_message_text")
-            if text_el:
-                for br in text_el.find_all("br"):
+            t = msg.select_one(".tgme_widget_message_text")
+            if t:
+                for br in t.find_all("br"):
                     br.replace_with("\n")
-                text = text_el.get_text()
-            text = (text or "").strip()
+                text = t.get_text().strip()
 
-            # תאריך/שעה
-            dt = None
-            time_el = msg.select_one("time[datetime]")
-            if time_el and time_el.get("datetime"):
-                try:
-                    dt = datetime.datetime.fromisoformat(time_el["datetime"])
-                except Exception:
-                    dt = None
+            # תאריך (ISO)
+            date_iso = None
+            tm = msg.select_one("time[datetime]")
+            if tm and tm.get("datetime"):
+                date_iso = tm["datetime"]
 
-            # תמונה (אם יש) — מתוך background-image
+            # תמונה
             img = None
-            photo = msg.select_one(".tgme_widget_message_photo_wrap")
-            if photo and photo.get("style"):
-                m = re.search(r"url\(['\"]?([^'\")]+)['\"]?\)", photo["style"])
-                if m:
-                    img = m.group(1)
-            if not img:
-                vthumb = msg.select_one(".tgme_widget_message_video_thumb")
-                if vthumb and vthumb.get("style"):
-                    m = re.search(r"url\(['\"]?([^'\")]+)['\"]?\)", vthumb["style"])
-                    if m:
-                        img = m.group(1)
+            pw = msg.select_one(".tgme_widget_message_photo_wrap")
+            if pw and pw.get("style"):
+                img = _bg_url(pw["style"])
 
-            if not text and not img:
+            # וידאו (קישור mp4 ישיר, אם טלגרם חושפת אותו)
+            video_src = None
+            vid = msg.select_one("video.tgme_widget_message_video, video.tgme_widget_message_roundvideo")
+            if vid and vid.get("src"):
+                video_src = vid["src"]
+
+            # תמונת תצוגה של וידאו (אם אין תמונה רגילה)
+            vthumb = msg.select_one(".tgme_widget_message_video_thumb")
+            if not img and vthumb and vthumb.get("style"):
+                img = _bg_url(vthumb["style"])
+
+            has_video = bool(video_src) or bool(
+                msg.select_one(".tgme_widget_message_video_player, .tgme_widget_message_video_thumb"))
+
+            if not text and not img and not has_video:
                 continue
 
-            items.append({"link": link, "text": text, "dt": dt, "img": img})
+            out.append({"id": mid, "link": link, "date": date_iso,
+                        "text": text, "img": img,
+                        "has_video": has_video, "video_src": video_src})
         except Exception:
-            # הודעה בעייתית — מדלגים עליה ולא מפילים את הריצה
             continue
-
-    items.reverse()              # החדש ביותר ראשון
-    return items[:MAX_ITEMS]
+    return out
 
 
+# ----------------------------- ארכיון -----------------------------
+def load_archive():
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            return {int(it["id"]): it for it in data}
+        except Exception:
+            return {}
+    return {}
+
+
+def stable(it):
+    """שדות יציבים לשמירה בארכיון (בלי ה-token המתחלף של הווידאו)."""
+    return {"id": it["id"], "link": it["link"], "date": it.get("date"),
+            "text": it.get("text", ""), "img": it.get("img"),
+            "has_video": bool(it.get("has_video"))}
+
+
+def upsert(archive, items):
+    for it in items:
+        archive[it["id"]] = stable(it)
+
+
+# ----------------------------- עזרי תאריך/כותרת -----------------------------
 def make_title(text: str) -> str:
     if not text:
         return CHANNEL_TITLE
     first = text.strip().split("\n")[0].strip()
-    if len(first) > 90:
-        first = first[:90].rstrip() + "…"
-    return first or CHANNEL_TITLE
+    return (first[:90].rstrip() + "…") if len(first) > 90 else (first or CHANNEL_TITLE)
 
 
-def to_rfc822(dt) -> str:
-    if dt is None:
-        dt = datetime.datetime.now(datetime.timezone.utc)
+def parse_dt(date_iso):
+    if not date_iso:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(date_iso)
+    except Exception:
+        return None
+
+
+def to_rfc822(date_iso) -> str:
+    dt = parse_dt(date_iso) or datetime.datetime.now(datetime.timezone.utc)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=datetime.timezone.utc)
     return email.utils.format_datetime(dt)
 
 
-def fmt_local(dt) -> str:
-    if dt is None:
+def fmt_local(date_iso) -> str:
+    dt = parse_dt(date_iso)
+    if not dt:
         return ""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=datetime.timezone.utc)
@@ -128,24 +176,19 @@ def fmt_local(dt) -> str:
 # ----------------------------- RSS -----------------------------
 def build_rss(items) -> str:
     now = email.utils.format_datetime(datetime.datetime.now(datetime.timezone.utc))
-    out = ['<?xml version="1.0" encoding="UTF-8"?>',
-           '<rss version="2.0">', '<channel>',
+    out = ['<?xml version="1.0" encoding="UTF-8"?>', '<rss version="2.0">', '<channel>',
            f"<title>{html.escape(SITE_TITLE)}</title>",
-           f"<link>{html.escape(SOURCE_URL)}</link>",
+           f"<link>{html.escape(BASE)}</link>",
            f"<description>{html.escape(SITE_DESC)}</description>",
-           "<language>he</language>",
-           f"<lastBuildDate>{now}</lastBuildDate>"]
-    for it in items:
-        body = html.escape(it["text"]).replace("\n", "<br/>")
-        desc = ""
-        if it["img"]:
-            desc += f'<img src="{html.escape(it["img"])}" /><br/>'
-        desc += body
+           "<language>he</language>", f"<lastBuildDate>{now}</lastBuildDate>"]
+    for it in items[:MAX_FEED_ITEMS]:
+        body = html.escape(it.get("text", "")).replace("\n", "<br/>")
+        desc = (f'<img src="{html.escape(it["img"])}" /><br/>' if it.get("img") else "") + body
         out += ["<item>",
-                f"<title>{html.escape(make_title(it['text']))}</title>",
+                f"<title>{html.escape(make_title(it.get('text', '')))}</title>",
                 f"<link>{html.escape(it['link'])}</link>",
                 f'<guid isPermaLink="true">{html.escape(it["link"])}</guid>',
-                f"<pubDate>{to_rfc822(it['dt'])}</pubDate>",
+                f"<pubDate>{to_rfc822(it.get('date'))}</pubDate>",
                 f"<description>{html.escape(desc)}</description>",
                 "</item>"]
     out += ["</channel>", "</rss>"]
@@ -158,7 +201,7 @@ HTML_HEAD = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="600">
+<meta http-equiv="refresh" content="300">
 <title>הפרגוד — עדכונים</title>
 <style>
   :root { --bg:#f4f5f7; --card:#ffffff; --ink:#1b1b1f; --muted:#6b7280; --accent:#0a7cff; --line:#e5e7eb; }
@@ -170,16 +213,19 @@ HTML_HEAD = """<!DOCTYPE html>
            padding:18px 20px; margin-bottom:16px; }
   header h1 { margin:0 0 4px; font-size:22px; }
   header .sub { color:var(--muted); font-size:14px; }
-  header a { color:var(--accent); text-decoration:none; }
+  a { color:var(--accent); }
   .card { background:var(--card); border:1px solid var(--line); border-radius:16px;
           padding:16px 18px; margin-bottom:14px; }
-  .card .thumb { width:100%; max-height:420px; object-fit:cover; border-radius:12px; margin-bottom:10px; }
+  .card .media { width:100%; max-height:460px; object-fit:cover; border-radius:12px;
+                 margin-bottom:10px; background:#000; display:block; }
   .card .body { white-space:normal; word-break:break-word; }
   .card .body a { color:var(--accent); }
+  .badge { display:inline-block; font-size:12px; color:var(--accent);
+           border:1px solid var(--accent); border-radius:999px; padding:1px 8px; margin-bottom:8px; }
   .card .meta { display:flex; justify-content:space-between; align-items:center;
                 margin-top:12px; padding-top:10px; border-top:1px solid var(--line);
                 color:var(--muted); font-size:13px; }
-  .card .meta a { color:var(--accent); text-decoration:none; font-weight:600; }
+  .card .meta a { text-decoration:none; font-weight:600; }
   footer { text-align:center; color:var(--muted); font-size:12px; padding:18px 0 28px; }
 </style>
 </head>
@@ -188,7 +234,7 @@ HTML_HEAD = """<!DOCTYPE html>
 """
 
 HTML_FOOT = """
-<footer>דף לא רשמי, נבנה אוטומטית מהעמוד הציבורי של הערוץ &middot; מתעדכן כל כ-20 דקות</footer>
+<footer>דף לא רשמי, נבנה אוטומטית מהעמוד הציבורי של הערוץ &middot; מתעדכן כל כ-5 דקות</footer>
 </div>
 </body>
 </html>
@@ -201,46 +247,78 @@ def linkify(escaped_text: str) -> str:
                   escaped_text)
 
 
-def build_html(items) -> str:
+def build_html(items, fresh_video) -> str:
     updated = datetime.datetime.now(datetime.timezone.utc).astimezone(IL_TZ).strftime("%d/%m/%Y %H:%M")
-    parts = [HTML_HEAD]
-    parts.append(
-        '<header>'
-        f'<h1>הפרגוד — עדכונים אחרונים</h1>'
-        f'<div class="sub">מקור: <a href="{html.escape("https://t.me/" + CHANNEL)}" target="_blank" rel="noopener">'
-        f'ערוץ הטלגרם של הפרגוד</a> &middot; עודכן לאחרונה: {updated}</div>'
-        '</header>'
-    )
+    parts = [HTML_HEAD,
+             '<header>'
+             '<h1>הפרגוד — עדכונים אחרונים</h1>'
+             f'<div class="sub">מקור: <a href="https://t.me/{CHANNEL}" target="_blank" rel="noopener">'
+             f'ערוץ הטלגרם של הפרגוד</a> &middot; מציג {len(items)} עדכונים &middot; עודכן: {updated}</div>'
+             '</header>']
     for it in items:
-        body = linkify(html.escape(it["text"])).replace("\n", "<br>")
-        thumb = f'<img class="thumb" src="{html.escape(it["img"])}" alt="">' if it["img"] else ""
-        date_str = fmt_local(it["dt"])
-        parts.append(
-            '<article class="card">'
-            f'{thumb}'
-            f'<div class="body">{body}</div>'
-            '<div class="meta">'
-            f'<span>{date_str}</span>'
-            f'<a href="{html.escape(it["link"])}" target="_blank" rel="noopener">צפה בטלגרם ↗</a>'
-            '</div>'
-            '</article>'
-        )
+        body = linkify(html.escape(it.get("text", ""))).replace("\n", "<br>")
+
+        media = ""
+        vid = fresh_video.get(it["id"])
+        if vid:  # סרטון טרי שניתן לנגן ישירות בדף
+            poster = f' poster="{html.escape(it["img"])}"' if it.get("img") else ""
+            media = (f'<video class="media" controls preload="none" playsinline{poster}>'
+                     f'<source src="{html.escape(vid)}" type="video/mp4"></video>')
+        elif it.get("img"):
+            media = f'<img class="media" loading="lazy" src="{html.escape(it["img"])}" alt="">'
+
+        badge = '<div class="badge">🎬 סרטון — צפה בטלגרם</div>' if (it.get("has_video") and not vid) else ""
+
+        parts.append('<article class="card">'
+                     f'{media}{badge}'
+                     f'<div class="body">{body}</div>'
+                     '<div class="meta">'
+                     f'<span>{fmt_local(it.get("date"))}</span>'
+                     f'<a href="{html.escape(it["link"])}" target="_blank" rel="noopener">צפה בטלגרם ↗</a>'
+                     '</div></article>')
     parts.append(HTML_FOOT)
     return "\n".join(parts)
 
 
 # ----------------------------- ראשי -----------------------------
 def main():
-    page = fetch_page()
-    items = parse_messages(page)
-    print(f"נמצאו {len(items)} פריטים")
+    archive = load_archive()
 
+    # 1) העמוד האחרון — הפוסטים החדשים ביותר (כאן ה-token של הווידאו טרי)
+    latest = parse_page(fetch(BASE))
+    fresh_video = {it["id"]: it["video_src"] for it in latest if it.get("video_src")}
+    upsert(archive, latest)
+
+    # 2) השלמת היסטוריה אחורה, עד שהארכיון מתמלא
+    pages = 0
+    while archive and len(archive) < MAX_ARCHIVE and pages < BACKFILL_PAGES_PER_RUN:
+        min_id = min(archive.keys())
+        try:
+            older = parse_page(fetch(f"{BASE}?before={min_id}"))
+        except Exception:
+            break
+        new_older = [it for it in older if it["id"] not in archive]
+        if not new_older:
+            break
+        upsert(archive, older)
+        pages += 1
+        time.sleep(0.5)
+
+    # מיון מהחדש לישן + חיתוך לגודל הארכיון
+    items = sorted(archive.values(), key=lambda x: x["id"], reverse=True)[:MAX_ARCHIVE]
+    archive = {it["id"]: it for it in items}
+
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(list(archive.values()), f, ensure_ascii=False)
     with open("feed.xml", "w", encoding="utf-8") as f:
         f.write(build_rss(items))
     with open("index.html", "w", encoding="utf-8") as f:
-        f.write(build_html(items))
-    print("נכתבו feed.xml ו-index.html")
+        f.write(build_html(items, fresh_video))
+
+    print(f"ארכיון: {len(items)} פריטים | סרטונים טריים: {len(fresh_video)} | "
+          f"עמודי היסטוריה נמשכו בריצה זו: {pages}")
 
 
 if __name__ == "__main__":
     main()
+# (סוף הקובץ)
