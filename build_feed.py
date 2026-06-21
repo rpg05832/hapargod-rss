@@ -375,9 +375,14 @@ def main():
 
     # שמירה ל-Drive — רק עבור הודעות *חדשות* (מכאן והלאה), לא להיסטוריה הקיימת
     svc = drive_service()
-    folder_id = drive_folder_id(svc) if svc else None
+    folder_id = None
     if svc:
-        print("Drive: מחובר. תיקייה:", folder_id)
+        try:
+            folder_id = drive_folder_id(svc)
+            print("Drive: מחובר. תיקייה:", folder_id)
+        except Exception as e:
+            print("Drive: אימות/תיקייה נכשלו — ממשיך בלי Drive:", e)
+            svc = None
     new_items = sorted([it for it in latest if it["id"] not in known], key=lambda x: x["id"])
     uploads = 0
     for it in new_items:
